@@ -1275,6 +1275,55 @@ export default function App() {
             </div>
           </div>
 
+          {/* Item-level demand forecast */}
+          <div className="forecast-card">
+            <div className="forecast-card-header">
+              <div>
+                <h3><TrendingUp size={20} /> 30-Day Demand Forecast</h3>
+                <p>
+                  Based on the latest 8 weeks of POS sales
+                  {analytics?.demand_forecast?.forecast_start_date && ` · forecast begins ${analytics.demand_forecast.forecast_start_date}`}
+                </p>
+              </div>
+              <span className="forecast-method-badge">Weekday-aware model</span>
+            </div>
+            <div className="forecast-table-wrap">
+              <table className="forecast-table">
+                <thead>
+                  <tr>
+                    <th>Product</th>
+                    <th>Daily Demand</th>
+                    <th>Next 30 Days</th>
+                    <th>Stock Cover</th>
+                    <th>Estimated Stock-out</th>
+                    <th>Confidence</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {analytics?.demand_forecast?.items?.length ? analytics.demand_forecast.items.map(item => (
+                    <tr key={item.product_id}>
+                      <td>
+                        <strong>{item.product_name}</strong>
+                        <span>{item.category} · {item.stock_level} units available</span>
+                      </td>
+                      <td>{item.avg_daily_demand} units/day</td>
+                      <td><strong>{item.forecast_30_days} units</strong></td>
+                      <td className={item.days_of_cover <= 30 ? 'forecast-risk' : ''}>
+                        {item.days_of_cover} days
+                      </td>
+                      <td className={item.days_of_cover <= 30 ? 'forecast-risk' : ''}>{item.estimated_stockout_date}</td>
+                      <td><span className={`confidence-badge ${item.confidence.toLowerCase()}`}>{item.confidence}</span></td>
+                    </tr>
+                  )) : (
+                    <tr>
+                      <td colSpan="6" className="forecast-empty">Loading sales history and forecasts…</td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+
           {/* Low Stock Reorder Table */}
           <div className="reorder-table-card">
             <h3 style={{ fontSize: '1.1rem', fontWeight: 800, color: 'var(--text-main)', marginBottom: '14px' }}>

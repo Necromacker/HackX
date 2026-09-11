@@ -3,6 +3,9 @@ import json
 import base64
 import io
 import datetime
+import glob
+import math
+from functools import lru_cache
 import pandas as pd
 from fastapi import FastAPI, Query, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
@@ -43,6 +46,81 @@ INVENTORY_FILE = os.path.join(DATA_DIR, "inventory.csv")
 BARCODES_FILE = os.path.join(DATA_DIR, "barcodes.csv")
 IMAGE_CACHE_FILE = os.path.join(DATA_DIR, "product_images.json")
 ORDERS_FILE = os.path.join(DATA_DIR, "orders.json")
+
+
+@lru_cache(maxsize=1)
+def load_sales_history() -> pd.DataFrame:
+    """Load the supplied POS exports once and normalize them for forecasting."""
+    sales_files = sorted(glob.glob(os.path.join(DATA_DIR, "sales_*.csv")))
+    if not sales_files:
+        return pd.DataFrame(columns=["product_id", "quantity_sold", "sale_date"])
+
+    frames = []
+    for path in sales_files:
+        sales = pd.read_csv(path, usecols=["product_id", "quantity_sold", "timestamp"])
+        sales["timestamp"] = pd.to_datetime(sales["timestamp"], errors="coerce")
+        sales = sales.dropna(subset=["timestamp", "product_id", "quantity_sold"])
+        sales["sale_date"] = sales["timestamp"].dt.normalize()
+        frames.append(sales[["product_id", "quantity_sold", "sale_date"]])
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
+def build_demand_forecasts(products: pd.DataFrame, horizon_days: int = 30) -> Dict[str, Any]:
+    """Forecast demand from the latest eight weeks, with a weekday seasonal adjustment.
+
+    This deliberately lightweight model works without optional ML dependencies and is
+    suitable for the short, regularly refreshed POS histories used by this project.
+    """
+    sales = load_sales_history()
+    if sales.empty:
+        return {"forecast_start_date": None, "horizon_days": horizon_days, "items": []}
+
+    latest_date = sales["sale_date"].max()
+    lookback_start = latest_date - pd.Timedelta(days=83)
+    recent = sales[sales["sale_date"] >= lookback_start]
+    daily = recent.groupby(["product_id", "sale_date"], as_index=False)["quantity_sold"].sum()
+    forecast_start = latest_date + pd.Timedelta(days=1)
+    future_dates = pd.date_range(forecast_start, periods=horizon_days, freq="D")
+    forecasts = []
+
+    for _, product in products.iterrows():
+        product_id = int(product["product_id"])
+        product_daily = daily[daily["product_id"] == product_id].set_index("sale_date")["quantity_sold"]
+        history_dates = pd.date_range(lookback_start, latest_date, freq="D")
+        series = product_daily.reindex(history_dates, fill_value=0.0).astype(float)
+        baseline = float(series.tail(56).mean())
+        if baseline <= 0:
+            continue
+
+        weekday_means = series.tail(56).groupby(series.tail(56).index.dayofweek).mean()
+        # Shrink the weekday pattern toward the average to avoid overreacting to noise.
+        weekday_factors = {day: 0.5 + 0.5 * (value / baseline) for day, value in weekday_means.items()}
+        future_demand = sum(baseline * weekday_factors.get(date.dayofweek, 1.0) for date in future_dates)
+        variation = float(series.tail(56).std(ddof=0) / baseline) if baseline else 0.0
+        confidence = "High" if variation < 0.35 else "Medium" if variation < 0.75 else "Low"
+        stock = int(product["stock_level"])
+        days_of_cover = round(stock / baseline, 1) if baseline else None
+        stockout_date = (latest_date + pd.Timedelta(days=math.ceil(stock / baseline))).date().isoformat() if stock > 0 else forecast_start.date().isoformat()
+
+        forecasts.append({
+            "product_id": product_id,
+            "product_name": str(product["product_name"]),
+            "category": str(product["category"]),
+            "stock_level": stock,
+            "avg_daily_demand": round(baseline, 1),
+            "forecast_30_days": int(round(future_demand)),
+            "days_of_cover": days_of_cover,
+            "estimated_stockout_date": stockout_date,
+            "confidence": confidence,
+        })
+
+    # Put products that will run out in the forecast window at the top.
+    forecasts.sort(key=lambda item: (item["days_of_cover"] is None, item["days_of_cover"] or float("inf")))
+    return {
+        "forecast_start_date": forecast_start.date().isoformat(),
+        "horizon_days": horizon_days,
+        "items": forecasts[:12],
+    }
 
 KNOWN_BRANDS = [
     'Hocco', 'Amul', 'Mother Dairy', 'Epigamia', 'Patanjali', 'Milkmaid', 'Nestle', 'Britannia', 
@@ -683,6 +761,7 @@ def get_analytics():
     """Calculates AI inventory analytics: stock health, reorder alerts, turnover, category velocity."""
     df = get_merged_data()
     orders = load_orders()
+    demand_forecast = build_demand_forecasts(df)
     
     # 1. Reorder Alerts (Stock <= Reorder Level)
     low_stock_df = df[df["stock_level"] <= df["reorder_level"]].sort_values(by="stock_level")
@@ -756,5 +835,6 @@ def get_analytics():
         "reorder_alerts": reorder_alerts,
         "top_billed_products": top_billed_products,
         "category_summary": cat_summary,
-        "ai_insights": ai_insights
+        "ai_insights": ai_insights,
+        "demand_forecast": demand_forecast
     }

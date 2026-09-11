@@ -1,0 +1,4 @@
+transaction_id,product_id,store_id,quantity_sold,sale_price,timestamp
+1,201,1,1,35.0,2026-09-12 00:01:52
+2,201,1,18,35.0,2026-09-12 00:02:44
+3,201,1,8,35.0,2026-09-12 00:11:32

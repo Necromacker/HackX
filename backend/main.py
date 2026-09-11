@@ -3,9 +3,7 @@ import json
 import base64
 import io
 import datetime
-import glob
 import math
-from functools import lru_cache
 import pandas as pd
 from fastapi import FastAPI, Query, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
@@ -45,24 +43,58 @@ PRODUCTS_FILE = os.path.join(DATA_DIR, "products.csv")
 INVENTORY_FILE = os.path.join(DATA_DIR, "inventory.csv")
 BARCODES_FILE = os.path.join(DATA_DIR, "barcodes.csv")
 IMAGE_CACHE_FILE = os.path.join(DATA_DIR, "product_images.json")
-ORDERS_FILE = os.path.join(DATA_DIR, "orders.json")
+SALES_2025_FILE = os.path.join(DATA_DIR, "sales_2025.csv")
 
 
-@lru_cache(maxsize=1)
 def load_sales_history() -> pd.DataFrame:
-    """Load the supplied POS exports once and normalize them for forecasting."""
-    sales_files = sorted(glob.glob(os.path.join(DATA_DIR, "sales_*.csv")))
+    """Load valid POS exports and normalize them for forecasting.
+
+    Empty files are ignored so a partially-created annual CSV cannot break the
+    Analytics page. Files are re-read on every request, making the Sync CSV
+    action reflect manual changes immediately.
+    """
+    sales_files = [SALES_2025_FILE] if os.path.exists(SALES_2025_FILE) else []
     if not sales_files:
         return pd.DataFrame(columns=["product_id", "quantity_sold", "sale_date"])
 
     frames = []
     for path in sales_files:
-        sales = pd.read_csv(path, usecols=["product_id", "quantity_sold", "timestamp"])
+        if os.path.getsize(path) == 0:
+            continue
+        try:
+            sales = pd.read_csv(path, usecols=["product_id", "quantity_sold", "timestamp"])
+        except (pd.errors.EmptyDataError, ValueError):
+            continue
         sales["timestamp"] = pd.to_datetime(sales["timestamp"], errors="coerce")
         sales = sales.dropna(subset=["timestamp", "product_id", "quantity_sold"])
         sales["sale_date"] = sales["timestamp"].dt.normalize()
         frames.append(sales[["product_id", "quantity_sold", "sale_date"]])
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
+def append_completed_sale(items: List["CartItem"], sold_at: datetime.datetime) -> int:
+    """Persist each billed item as a POS transaction used by demand forecasting."""
+    has_existing_sales = os.path.exists(SALES_2025_FILE) and os.path.getsize(SALES_2025_FILE) > 0
+    next_transaction_id = 1
+    if has_existing_sales:
+        existing_ids = pd.read_csv(SALES_2025_FILE, usecols=["transaction_id"])
+        if not existing_ids.empty:
+            next_transaction_id = int(existing_ids["transaction_id"].max()) + 1
+
+    rows = []
+    for item in items:
+        rows.append({
+            # All lines on one invoice share an ID, allowing the Orders view to
+            # rebuild the complete bill directly from this item-level CSV.
+            "transaction_id": next_transaction_id,
+            "product_id": item.product_id,
+            "store_id": 1,
+            "quantity_sold": item.quantity,
+            "sale_price": item.unit_price,
+            "timestamp": sold_at.strftime("%Y-%m-%d %H:%M:%S"),
+        })
+    pd.DataFrame(rows).to_csv(SALES_2025_FILE, mode="a", header=not has_existing_sales, index=False)
+    return next_transaction_id
 
 
 def build_demand_forecasts(products: pd.DataFrame, horizon_days: int = 30) -> Dict[str, Any]:
@@ -76,9 +108,7 @@ def build_demand_forecasts(products: pd.DataFrame, horizon_days: int = 30) -> Di
         return {"forecast_start_date": None, "horizon_days": horizon_days, "items": []}
 
     latest_date = sales["sale_date"].max()
-    lookback_start = latest_date - pd.Timedelta(days=83)
-    recent = sales[sales["sale_date"] >= lookback_start]
-    daily = recent.groupby(["product_id", "sale_date"], as_index=False)["quantity_sold"].sum()
+    daily = sales.groupby(["product_id", "sale_date"], as_index=False)["quantity_sold"].sum()
     forecast_start = latest_date + pd.Timedelta(days=1)
     future_dates = pd.date_range(forecast_start, periods=horizon_days, freq="D")
     forecasts = []
@@ -86,9 +116,27 @@ def build_demand_forecasts(products: pd.DataFrame, horizon_days: int = 30) -> Di
     for _, product in products.iterrows():
         product_id = int(product["product_id"])
         product_daily = daily[daily["product_id"] == product_id].set_index("sale_date")["quantity_sold"]
-        history_dates = pd.date_range(lookback_start, latest_date, freq="D")
+        history_end = latest_date
+        history_dates = pd.date_range(history_end - pd.Timedelta(days=55), history_end, freq="D")
         series = product_daily.reindex(history_dates, fill_value=0.0).astype(float)
+        latest_series = series.copy()
+        # A newly recorded bill may be much newer than the seeded history. When
+        # fewer than 14 selling days exist in the latest 8 weeks, use the same
+        # seasonal window one year earlier instead of treating missing history as
+        # zero demand.
+        used_seasonal_history = int((series > 0).sum()) < 14
+        if used_seasonal_history:
+            history_end = latest_date - pd.DateOffset(years=1)
+            history_dates = pd.date_range(history_end - pd.Timedelta(days=55), history_end, freq="D")
+            series = product_daily.reindex(history_dates, fill_value=0.0).astype(float)
         baseline = float(series.tail(56).mean())
+        short_history = False
+        if baseline <= 0 and used_seasonal_history:
+            # With a brand-new store there is no prior-year history yet. Use the
+            # available billed transactions, but clearly mark the forecast low-confidence.
+            series = latest_series
+            baseline = float(series.tail(56).mean())
+            short_history = True
         if baseline <= 0:
             continue
 
@@ -98,6 +146,10 @@ def build_demand_forecasts(products: pd.DataFrame, horizon_days: int = 30) -> Di
         future_demand = sum(baseline * weekday_factors.get(date.dayofweek, 1.0) for date in future_dates)
         variation = float(series.tail(56).std(ddof=0) / baseline) if baseline else 0.0
         confidence = "High" if variation < 0.35 else "Medium" if variation < 0.75 else "Low"
+        if used_seasonal_history and confidence == "High":
+            confidence = "Medium"
+        if short_history:
+            confidence = "Low"
         stock = int(product["stock_level"])
         days_of_cover = round(stock / baseline, 1) if baseline else None
         stockout_date = (latest_date + pd.Timedelta(days=math.ceil(stock / baseline))).date().isoformat() if stock > 0 else forecast_start.date().isoformat()
@@ -420,17 +472,54 @@ def decode_barcode_from_image(image: Any) -> Optional[str]:
     return None
 
 def load_orders() -> List[Dict[str, Any]]:
-    if os.path.exists(ORDERS_FILE):
-        try:
-            with open(ORDERS_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return []
-    return []
+    """Rebuild recent invoice-style orders from the sales_2025 POS export."""
+    if not os.path.exists(SALES_2025_FILE):
+        return []
 
-def save_orders(orders: List[Dict[str, Any]]):
-    with open(ORDERS_FILE, "w", encoding="utf-8") as f:
-        json.dump(orders, f, indent=2)
+    try:
+        sales = pd.read_csv(SALES_2025_FILE)
+        if sales.empty:
+            return []
+        sales["timestamp"] = pd.to_datetime(sales["timestamp"], errors="coerce")
+        sales = sales.dropna(subset=["timestamp", "product_id", "quantity_sold", "sale_price"])
+        # The CSV may contain a full year's POS history. Only recent rows are
+        # needed for the Orders screen; grouping every historical line would make
+        # the dashboard slow for no user benefit.
+        sales = sales.sort_values("timestamp", ascending=False).head(500).copy()
+        product_names = pd.read_csv(PRODUCTS_FILE, usecols=["product_id", "product_name"])
+        sales = sales.merge(product_names, on="product_id", how="left")
+        sales["product_name"] = sales["product_name"].fillna("Unknown product")
+
+        orders = []
+        grouped = sales.groupby(["transaction_id", "timestamp"], sort=False)
+        for (transaction_id, created_at), lines in grouped:
+            items = [{
+                "product_id": int(line.product_id),
+                "product_name": str(line.product_name),
+                "quantity": int(line.quantity_sold),
+                "unit_price": float(line.sale_price),
+                "unit_of_measure": "Unit",
+            } for line in lines.itertuples()]
+            subtotal = round(sum(item["quantity"] * item["unit_price"] for item in items), 2)
+            orders.append({
+                "order_id": f"SALE-{int(transaction_id)}",
+                "created_at": created_at.strftime("%Y-%m-%d %H:%M:%S"),
+                "customer_name": "Walk-in Customer",
+                "customer_phone": "",
+                "payment_method": "Recorded POS Sale",
+                "status": "COMPLETED",
+                "items_count": len(items),
+                "total_units": sum(item["quantity"] for item in items),
+                "subtotal": subtotal,
+                "tax": 0.0,
+                "discount": 0.0,
+                "total_amount": subtotal,
+                "items": items,
+                "inventory_updates": [],
+            })
+        return sorted(orders, key=lambda order: order["created_at"], reverse=True)[:100]
+    except Exception:
+        return []
 
 # =================== API ENDPOINTS ===================
 
@@ -715,7 +804,8 @@ def checkout_endpoint(req: CheckoutRequest):
 
     # Generate Order Record
     now = datetime.datetime.now()
-    order_id = f"ORD-{now.strftime('%Y%m%d%H%M%S')}"
+    transaction_id = append_completed_sale(req.items, now)
+    order_id = f"SALE-{transaction_id}"
     
     order_record = {
         "order_id": order_id,
@@ -733,10 +823,6 @@ def checkout_endpoint(req: CheckoutRequest):
         "items": [item.dict() for item in req.items],
         "inventory_updates": updated_items
     }
-    
-    orders = load_orders()
-    orders.insert(0, order_record)
-    save_orders(orders)
 
     return {
         "status": "success",
